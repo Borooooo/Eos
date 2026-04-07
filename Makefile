@@ -1,7 +1,7 @@
 # made by claude too lazy to write this makefile shi
 SHELL := /usr/bin/env bash
 
-.PHONY: help host-prereqs host-check layout fetch binutils gcc1 headers glibc gcc2 toolchain kernel rootfs run pkg-test test-pkg all
+.PHONY: help host-prereqs host-check layout fetch binutils gcc1 headers glibc gcc2 toolchain kernel rootfs run gui-test pkg-test test-pkg all
 
 help:
 	@echo "Eos build targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  toolchain     Build binutils, gcc stage1, headers, glibc, gcc stage2"
 	@echo "  kernel        Build Linux kernel"
 	@echo "  rootfs        Build busybox initramfs"
+	@echo "  gui-test      Boot VM and attempt minimal GUI bootstrap with tty fallback"
 	@echo "  pkg-test      Build and install sample eospkg package"
 	@echo "  test-pkg      Run eospkg smoke tests"
 	@echo "  run           Boot kernel + initramfs in QEMU"
@@ -65,5 +66,8 @@ test-pkg:
 
 run:
 	./scripts/build/90_run_qemu.sh
+
+gui-test:
+	./scripts/gui/run_weston_test.sh
 
 all: layout fetch toolchain kernel rootfs
