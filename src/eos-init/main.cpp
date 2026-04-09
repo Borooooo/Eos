@@ -6,6 +6,8 @@
 #include <signal.h>
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
+#include <termios.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/if.h>
@@ -17,6 +19,9 @@ void mout_fs(const char* source, const char* target, const char* type) {
 
     if(mount(source, target, type, 0, nullptr) == 0) {
         std::cout << "mounted " << type << " in " << target << std::endl;
+    }
+    else if(errno == EBUSY) {
+        std::cout << type << " already mounted in " << target << std::endl;
     }
     else {
         std::cerr << "error " << type << " on " << target << " : " << strerror(errno) << std::endl;
@@ -67,11 +72,56 @@ void cleanup_and_reboot() {
 
 
 }
+
+// speed i need this
+void try_start_gui() {
+    pid_t pid = fork();
+    if(pid == 0) {
+        char *argv[] = { (char*)"/etc/init.d/gui-start", nullptr};
+        char* envp[] = { 
+            (char*)"XDG_RUNTIME_DIR=/run",
+            (char*)"HOME=/root",
+            (char*)"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+            nullptr
+        };
+
+        execve("/etc/init.d/gui-start", argv, envp);
+        _exit(1);
+    }
+
+    else if(pid > 0) {
+        int status;
+        waitpid(pid , &status, 0);
+    }
+}
+
 void start_shell() {
     pid_t pid = fork();
 
     if(pid == -1) perror("FORK FAILED");
     else if( pid == 0) {
+        if(setsid() < 0) {
+            perror("setsid failed");
+        }
+
+        int console_fd = open("/dev/console", O_RDWR);
+        if(console_fd < 0) {
+            perror("open /dev/console failed");
+        }
+        else {
+            if(ioctl(console_fd, TIOCSCTTY, 0) < 0) {
+                perror("TIOCSCTTY failed");
+            }
+
+            dup2(console_fd, STDIN_FILENO);
+            dup2(console_fd, STDOUT_FILENO);
+            dup2(console_fd, STDERR_FILENO);
+
+            if(console_fd > STDERR_FILENO) {
+                close(console_fd);
+            }
+        }
+
         char *argv[] = { (char *) "/bin/sh", nullptr};
         char *envp[] = {nullptr}; // env. variables
 
@@ -141,13 +191,13 @@ int main() {
     mout_fs("none", "/sys", "sysfs");
     mout_fs("devtmpfs", "/dev", "devtmpfs");
 
-    
-    mount("tmpfs", "/tmp", "tmpfs", 0, nullptr);
-    mount("tmpfs", "/run", "tmpfs", 0, nullptr);
+    mout_fs("tmpfs", "/tmp", "tmpfs");
+    mout_fs("tmpfs", "/run", "tmpfs");
 
     setup_network();
     setup_signals();
 
+    try_start_gui();
     start_shell();
 
     std::cout << "PID1 READY" << std::endl;

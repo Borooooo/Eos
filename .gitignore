@@ -23,6 +23,10 @@ README*
 *.py
 *.sh
 
+*.log
+*.script
+*.exit
+
 __pycache__/
 *.pyc
 eos-init

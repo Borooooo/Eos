@@ -1,0 +1,69 @@
+#!/bin/sh
+
+# all ethernet interfaces (skip lo)
+get_interfaces() {
+    for iface in /sys/class/net/*; do
+        name=$(basename "$iface")
+        [ "$name" = "lo" ] && continue
+        [ -d "$iface/device" ] && echo "$name"
+    done
+}
+
+start_network() {
+    echo "[NET] starting network configuration"
+
+    sleep 1
+    
+    interfaces=$(get_interfaces)
+    
+    if [ -z "$interfaces" ]; then
+        echo "[NET]no network interfaces found"
+        return 1
+    fi
+    
+    for iface in $interfaces; do
+        echo "[NET] configuring $iface via DHCP"
+        ip link set "$iface" up
+        
+        #udhcpc in background with timeout
+        udhcpc -i "$iface" -s /usr/share/udhcpc/default.script \
+               -t 5 -T 3 -A 3 -b -q 2>/dev/null &
+    done
+    
+    # wait a bit for DHCP
+    sleep 3
+    
+    # show network status
+    echo "[NET] network status:"
+    ip addr show | grep -E "^[0-9]|inet " | head -20
+    
+    return 0
+}
+
+stop_network() {
+    echo "[NET] stopping network..."
+    killall udhcpc 2>/dev/null
+    
+    for iface in $(get_interfaces); do
+        ip addr flush dev "$iface"
+        ip link set "$iface" down
+    done
+}
+
+case "${1:-start}" in
+    start)
+        start_network
+        ;;
+    stop)
+        stop_network
+        ;;
+    restart)
+        stop_network
+        sleep 1
+        start_network
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
