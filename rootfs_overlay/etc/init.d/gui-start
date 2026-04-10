@@ -1,5 +1,5 @@
 #!/bin/sh
-
+# gui startup script
 
 export XDG_RUNTIME_DIR=/run/user/0
 mkdir -p "$XDG_RUNTIME_DIR"
@@ -8,47 +8,59 @@ chmod 0700 "$XDG_RUNTIME_DIR"
 export HOME=/root
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
-
+# start network first
 if [ -x /etc/init.d/network ]; then
     echo "[GUI] Starting network..."
     /etc/init.d/network start
 fi
 
-WESTON_BIN=/usr/bin/weston
-LOGFILE=/var/log/weston.log
-
-# check if weston exists i hate ts
-if [ ! -x "$WESTON_BIN" ]; then
-    echo "[GUI] weston not found -> staying in TTY mode"
-    exit 0
-fi
-
-# logs
 mkdir -p /var/log
 
-# try DRM backend first
-echo "[GUI] attempting to start weston with DRM backend..."
-$WESTON_BIN --backend=drm --shell=kiosk-shell.so --log="$LOGFILE" 2>&1 &
-WESTON_PID=$!
-sleep 2
-
-
-# check if weston started
-if kill -0 $WESTON_PID 2>/dev/null; then
-    echo "[GUI] weston started successfully (PID $WESTON_PID)"
+if [ ! -x /etc/sv/weston/run ]; then
+    # fallback to direct weston start if no service defined
+    WESTON_BIN=/usr/bin/weston
+    LOGFILE=/var/log/weston.log
+    
+    if [ ! -x "$WESTON_BIN" ]; then
+        echo "[GUI] weston not found staying in TTY mode"
+        exit 0
+    fi
+    
+    echo "[GUI] starting weston directly"
+    $WESTON_BIN --backend=drm --shell=kiosk-shell.so --log="$LOGFILE" 2>&1 &
+    WESTON_PID=$!
+    sleep 2
+    
+    if ! kill -0 $WESTON_PID 2>/dev/null; then
+        $WESTON_BIN --backend=headless --shell=kiosk-shell.so --log="$LOGFILE" 2>&1 &
+    fi
     exit 0
 fi
 
-# DRM failed ->  headless for quemu/testing
-echo "[GUI] DRM backend failed -> trying headless..."
-$WESTON_BIN --backend=headless --shell=kiosk-shell.so --log="$LOGFILE" 2>&1 &
-WESTON_PID=$!
-sleep 2
-
-if kill -0 $WESTON_PID 2>/dev/null; then
-    echo "[GUI] weston (headless) started (PID $WESTON_PID)"
+# start supervisor in background
+if [ ! -x /usr/bin/eos-sv ]; then
+    echo "[GUI] eos-sv not found staying in TTY mode"
     exit 0
 fi
 
-echo "[GUI]aAll backends failed -> check $LOGFILE"
-exit 1
+if [ -f /run/eos-sv.pid ] && kill -0 "$(cat /run/eos-sv.pid 2>/dev/null)" 2>/dev/null; then
+    echo "[GUI] supervisor already running"
+else
+    echo "[GUI] starting supervisor"
+    /usr/bin/eos-sv supervise &
+    SV_PID=$!
+    echo "$SV_PID" > /run/sv.pid
+fi
+
+
+sleep 3
+
+
+
+if /usr/bin/eos-sv status 2>/dev/null | grep -q "weston: running"; then
+    echo "[GUI] Weston is supervised and running"
+    exit 0
+fi
+
+echo "[GUI] spervisor started"
+exit 0

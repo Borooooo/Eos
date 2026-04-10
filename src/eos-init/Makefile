@@ -13,9 +13,8 @@ all: $(TARGET_BIN)
 $(TARGET_BIN): main.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 	@echo "===================================="
-	@echo "Zbudowano $@!"
-	@echo "Mozesz to wbudowac do initramfs zastapujac skrypt bashowy /init"
-	@echo "Polecenie np: file $@"
+	@echo "done $@!"
+
 
 clean:
 	rm -f $(TARGET_BIN)

@@ -1,0 +1,384 @@
+#!/bin/sh
+# monitors services and restarts them if they crash.
+# safety hardening:
+# validates service names
+# tracks PID start time to avoid stale PID reuse
+# restart limit with backoff window
+# graceful shutdown of supervised services
+# half of this bash shi  is vibed tbh but who cares
+
+set -u
+
+SERVICES_DIR="${SERVICES_DIR:-/etc/sv}"
+SUPERVISOR_LOG="${SUPERVISOR_LOG:-/var/log/supervisor.log}"
+PIDS_DIR="${PIDS_DIR:-/run/sv}"
+SUPERVISOR_PID_FILE="${SUPERVISOR_PID_FILE:-/run/eos-sv.pid}"
+
+CHECK_INTERVAL="${EOS_SV_CHECK_INTERVAL:-5}"
+MAX_RESTARTS="${EOS_SV_MAX_RESTARTS:-5}"
+RESTART_WINDOW="${EOS_SV_RESTART_WINDOW:-60}"
+RESTART_BACKOFF="${EOS_SV_RESTART_BACKOFF:-30}"
+
+shutdown_requested=0
+
+umask 077
+mkdir -p "$PIDS_DIR" /var/log
+
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_valid_service_name() {
+    case "$1" in
+        ''|*[!A-Za-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+pid_file_for() {
+    printf '%s/%s.pid\n' "$PIDS_DIR" "$1"
+}
+
+restart_file_for() {
+    printf '%s/%s.restarts\n' "$PIDS_DIR" "$1"
+}
+
+log() {
+    msg="$*"
+    echo "[SV] $(date '+%H:%M:%S') $msg"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$SUPERVISOR_LOG" 2>/dev/null
+}
+
+proc_start_time() {
+    pid="$1"
+    [ -r "/proc/$pid/stat" ] || return 1
+    awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
+}
+
+read_pid_record() {
+    name="$1"
+    file="$(pid_file_for "$name")"
+    [ -f "$file" ] || return 1
+
+    IFS=' ' read -r pid started < "$file" || return 1
+    [ -n "${pid:-}" ] || return 1
+    [ -n "${started:-}" ] || return 1
+    is_uint "$pid" || return 1
+    is_uint "$started" || return 1
+
+    printf '%s %s\n' "$pid" "$started"
+}
+
+check_service() {
+    name="$1"
+    record="$(read_pid_record "$name")" || return 1
+
+    pid="${record%% *}"
+    started="${record#* }"
+
+    kill -0 "$pid" 2>/dev/null || return 1
+    now_started="$(proc_start_time "$pid")" || return 1
+    [ "$now_started" = "$started" ]
+}
+
+list_services() {
+    [ -d "$SERVICES_DIR" ] || return 0
+
+    for svc in "$SERVICES_DIR"/*; do
+        [ -d "$svc" ] || continue
+        name="$(basename "$svc")"
+        if is_valid_service_name "$name"; then
+            printf '%s\n' "$name"
+        else
+            log "WARN: skipping invalid service name: $name"
+        fi
+    done
+}
+
+start_service() {
+    name="$1"
+    svc_dir="$SERVICES_DIR/$name"
+    pid_file="$(pid_file_for "$name")"
+
+    if ! is_valid_service_name "$name"; then
+        log "ERROR: invalid service name: $name"
+        return 1
+    fi
+
+    if [ ! -f "$svc_dir/run" ] || [ ! -x "$svc_dir/run" ]; then
+        log "ERROR: $name/run not found or not executable"
+        return 1
+    fi
+
+    if check_service "$name"; then
+        record="$(read_pid_record "$name")"
+        pid="${record%% *}"
+        log "$name already running (PID $pid)"
+        return 0
+    fi
+
+    rm -f "$pid_file"
+
+    log "Starting $name..."
+    "$svc_dir/run" &
+    pid=$!
+
+    sleep 1
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log "ERROR: $name failed to start"
+        return 1
+    fi
+
+    started="$(proc_start_time "$pid")"
+    if ! is_uint "$started"; then
+        log "ERROR: failed to read start time for $name (PID $pid)"
+        kill "$pid" 2>/dev/null || true
+        return 1
+    fi
+
+    printf '%s %s\n' "$pid" "$started" > "$pid_file"
+    log "$name started (PID $pid)"
+    return 0
+}
+
+stop_service() {
+    name="$1"
+    pid_file="$(pid_file_for "$name")"
+
+    if ! is_valid_service_name "$name"; then
+        log "ERROR: invalid service name: $name"
+        return 1
+    fi
+
+    if [ ! -f "$pid_file" ]; then
+        log "$name not running"
+        return 0
+    fi
+
+    record="$(read_pid_record "$name")" || {
+        rm -f "$pid_file"
+        log "$name had invalid pid record, cleaned up"
+        return 0
+    }
+
+    pid="${record%% *}"
+
+    if ! check_service "$name"; then
+        rm -f "$pid_file"
+        log "$name already stopped"
+        return 0
+    fi
+
+    log "Stopping $name (PID $pid)..."
+    kill "$pid" 2>/dev/null || true
+
+    i=0
+    while [ "$i" -lt 5 ]; do
+        if ! check_service "$name"; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+
+    if check_service "$name"; then
+        log "Force killing $name (PID $pid)..."
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$pid_file"
+    log "$name stopped"
+}
+
+restart_allowed() {
+    name="$1"
+    now="$(date +%s)"
+    state_file="$(restart_file_for "$name")"
+
+    window_start=0
+    count=0
+    blocked_until=0
+
+    if [ -f "$state_file" ]; then
+        IFS=' ' read -r window_start count blocked_until < "$state_file" || true
+    fi
+
+    is_uint "$window_start" || window_start=0
+    is_uint "$count" || count=0
+    is_uint "$blocked_until" || blocked_until=0
+
+    if [ "$blocked_until" -gt "$now" ]; then
+        remaining=$((blocked_until - now))
+        log "WARN: $name is in restart backoff (${remaining}s left)"
+        return 1
+    fi
+
+    if [ "$window_start" -eq 0 ] || [ $((now - window_start)) -gt "$RESTART_WINDOW" ]; then
+        window_start="$now"
+        count=0
+    fi
+
+    count=$((count + 1))
+
+    if [ "$count" -gt "$MAX_RESTARTS" ]; then
+        blocked_until=$((now + RESTART_BACKOFF))
+        printf '%s %s %s\n' "$now" 0 "$blocked_until" > "$state_file"
+        log "ERROR: $name exceeded restart limit (${MAX_RESTARTS}/${RESTART_WINDOW}s), backing off ${RESTART_BACKOFF}s"
+        return 1
+    fi
+
+    printf '%s %s %s\n' "$window_start" "$count" 0 > "$state_file"
+    return 0
+}
+
+stop_all_services() {
+    list_services | while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        stop_service "$name"
+    done
+}
+
+acquire_lock() {
+    if [ -f "$SUPERVISOR_PID_FILE" ]; then
+        old_pid="$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
+        if is_uint "$old_pid" && kill -0 "$old_pid" 2>/dev/null; then
+            log "ERROR: supervisor already running (PID $old_pid)"
+            return 1
+        fi
+        rm -f "$SUPERVISOR_PID_FILE"
+    fi
+
+    printf '%s\n' "$$" > "$SUPERVISOR_PID_FILE"
+    return 0
+}
+
+release_lock() {
+    rm -f "$SUPERVISOR_PID_FILE"
+}
+
+handle_shutdown() {
+    shutdown_requested=1
+}
+
+supervise() {
+    if ! is_uint "$CHECK_INTERVAL" || [ "$CHECK_INTERVAL" -lt 1 ]; then
+        CHECK_INTERVAL=5
+    fi
+    if ! is_uint "$MAX_RESTARTS" || [ "$MAX_RESTARTS" -lt 1 ]; then
+        MAX_RESTARTS=5
+    fi
+    if ! is_uint "$RESTART_WINDOW" || [ "$RESTART_WINDOW" -lt 1 ]; then
+        RESTART_WINDOW=60
+    fi
+    if ! is_uint "$RESTART_BACKOFF" || [ "$RESTART_BACKOFF" -lt 1 ]; then
+        RESTART_BACKOFF=30
+    fi
+
+    log "Supervisor starting..."
+
+    if [ ! -d "$SERVICES_DIR" ]; then
+        log "No services directory: $SERVICES_DIR"
+        return 1
+    fi
+
+    services="$(list_services | tr '\n' ' ')"
+    if [ -z "$services" ]; then
+        log "No services found in $SERVICES_DIR"
+        return 0
+    fi
+
+    log "Services to supervise: $services"
+
+    if ! acquire_lock; then
+        return 1
+    fi
+
+    trap 'handle_shutdown' INT TERM HUP QUIT
+
+    for name in $services; do
+        start_service "$name" || true
+    done
+
+    while [ "$shutdown_requested" -eq 0 ]; do
+        sleep "$CHECK_INTERVAL"
+
+        for name in $services; do
+            if ! check_service "$name"; then
+                log "CRASH: $name died"
+                if restart_allowed "$name"; then
+                    start_service "$name" || true
+                fi
+            fi
+        done
+    done
+
+    log "Supervisor stopping..."
+    stop_all_services
+    release_lock
+    return 0
+}
+
+print_status() {
+    now="$(date +%s)"
+
+    for svc in "$SERVICES_DIR"/*; do
+        [ -d "$svc" ] || continue
+        name="$(basename "$svc")"
+        if ! is_valid_service_name "$name"; then
+            continue
+        fi
+
+        if check_service "$name"; then
+            record="$(read_pid_record "$name")"
+            pid="${record%% *}"
+            echo "$name: running (PID $pid)"
+            continue
+        fi
+
+        state_file="$(restart_file_for "$name")"
+        if [ -f "$state_file" ]; then
+            IFS=' ' read -r _ _ blocked_until < "$state_file" || true
+            if is_uint "$blocked_until" && [ "$blocked_until" -gt "$now" ]; then
+                remaining=$((blocked_until - now))
+                echo "$name: stopped (restart backoff ${remaining}s)"
+                continue
+            fi
+        fi
+
+        echo "$name: stopped"
+    done
+}
+
+case "${1:-supervise}" in
+    start)
+        [ -n "${2:-}" ] || { echo "Usage: $0 start <service>"; exit 1; }
+        start_service "$2"
+        ;;
+    stop)
+        [ -n "${2:-}" ] || { echo "Usage: $0 stop <service>"; exit 1; }
+        stop_service "$2"
+        ;;
+    restart)
+        [ -n "${2:-}" ] || { echo "Usage: $0 restart <service>"; exit 1; }
+        stop_service "$2"
+        sleep 1
+        start_service "$2"
+        ;;
+    stop-all)
+        stop_all_services
+        ;;
+    status)
+        print_status
+        ;;
+    supervise)
+        supervise
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|stop-all|status|supervise} [service]"
+        exit 1
+        ;;
+esac

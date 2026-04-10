@@ -1,7 +1,7 @@
 # made by claude too lazy to write this makefile shi
 SHELL := /usr/bin/env bash
 
-.PHONY: help host-prereqs host-check layout fetch binutils gcc1 headers glibc gcc2 toolchain kernel gui-core gui-wayland gui-input weston gui-stack rootfs run gui-test pkg-test test-pkg all
+.PHONY: help host-prereqs host-check layout fetch binutils gcc1 headers glibc gcc2 toolchain kernel gui-core gui-wayland gui-input weston gui-stack rootfs run iso run-iso gui-test pkg-test test-pkg test-security all
 
 help:
 	@echo "Eos build targets:"
@@ -17,9 +17,12 @@ help:
 	@echo "  weston        Build native Weston compositor"
 	@echo "  gui-stack     Build full native Weston stack"
 	@echo "  rootfs        Build busybox initramfs"
+	@echo "  iso           Build bootable ISO (GRUB + kernel + initramfs)"
+	@echo "  run-iso       Boot ISO image in QEMU"
 	@echo "  gui-test      Boot VM and attempt minimal GUI bootstrap with tty fallback"
 	@echo "  pkg-test      Build and install sample eospkg package"
 	@echo "  test-pkg      Run eospkg smoke tests"
+	@echo "  test-security Run repo/index/installer security tests"
 	@echo "  run           Boot kernel + initramfs in QEMU"
 
 host-prereqs:
@@ -83,8 +86,17 @@ pkg-test:
 test-pkg:
 	python3 -m unittest -v tests/test_eospkg_smoke.py
 
+test-security:
+	python3 -m unittest -v tests/test_repo_index.py tests/test_eospkg_repo.py tests/test_install_rootfs.py
+
 run:
 	./scripts/build/90_run_qemu.sh
+
+iso: kernel rootfs
+	./scripts/build/95_build_iso.sh
+
+run-iso:
+	./scripts/build/96_run_qemu_iso.sh
 
 gui-test: kernel rootfs
 	./scripts/gui/run_weston_test.sh

@@ -1,0 +1,16 @@
+#!/bin/sh
+# weston compositor service
+
+export XDG_RUNTIME_DIR=/run/user/0
+export HOME=/root
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+mkdir -p /var/log
+
+LOGFILE=/var/log/weston.log
+
+/usr/bin/weston --backend=drm --shell=kiosk-shell.so --log="$LOGFILE" 2>&1
+
+exec /usr/bin/weston --backend=headless --shell=kiosk-shell.so --log="$LOGFILE" 2>&1
